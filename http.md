@@ -1,4 +1,4 @@
-# net/http
+# net/http 底层原理解析
 
 ## 1.CS架构示例
 
@@ -192,7 +192,7 @@ func TestClient(t *testing.T) {
   ```go
   type ServeMux struct {
   	mu    sync.RWMutex
-  	m     map[string]muxEntry
+  	m     map[string]muxEntry //维护从path到handler的映射关系
   	es    []muxEntry // slice of entries sorted from longest to shortest.
   	hosts bool       // whether any patterns contain hostnames
   }
@@ -209,4 +209,276 @@ func TestClient(t *testing.T) {
 
 ### 2.2 注册 handler
 
+​	   服务端注册hendler 主干链路：
+
 ![](./tmp/go-http-handler注册主干链路.PNG)
+
+
+
+在net/http包下声明了一个单例ServerMux，当用户直接通过公开方法http.HandleFunc 注册handler时，则会将其注册到 DefaultServeMux 中。
+
+```go
+// DefaultServeMux is the default ServeMux used by Serve.
+var DefaultServeMux = &defaultServeMux
+
+var defaultServeMux ServeMux
+```
+
+```go
+// HandleFunc registers the handler function for the given pattern
+// in the DefaultServeMux.
+// The documentation for ServeMux explains how patterns are matched.
+func HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
+	DefaultServeMux.HandleFunc(pattern, handler)
+}
+```
+
+
+
+在ServeMux.HandleFunc 内部将处理函数handler转为实现了ServerHTTP方法的HandlerFunc类型，将其作为Handler interface 的实现类注册到 ServeMux 的路由Map中
+
+```go
+// The HandlerFunc type is an adapter to allow the use of
+// ordinary functions as HTTP handlers. If f is a function
+// with the appropriate signature, HandlerFunc(f) is a
+// Handler that calls f.
+type HandlerFunc func(ResponseWriter, *Request)
+
+// ServeHTTP calls f(w, r).
+func (f HandlerFunc) ServeHTTP(w ResponseWriter, r *Request) {
+	f(w, r)
+}
+
+// HandleFunc registers the handler function for the given pattern.
+func (mux *ServeMux) HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
+	//...
+	mux.Handle(pattern, HandlerFunc(handler))
+}
+```
+
+
+
+实现路由注册的核心逻辑位于ServeMux.Handle 方法中，2个核心点：
+
+- 将path 和 handler包装成一个muxEntry，以path为key注册到理由 map ServeMux.m中
+- 响应模糊匹配机制，对于以"/"结尾的path,根据path长度将 muxEntry有序插入数组ServeMux.es 中（2.3说明模糊匹配）
+
+```go 
+// Handle registers the handler for the given pattern.
+// If a handler already exists for pattern, Handle panics.
+func (mux *ServeMux) Handle(pattern string, handler Handler) {
+	mux.mu.Lock()
+	defer mux.mu.Unlock()
+	//...
+	e := muxEntry{h: handler, pattern: pattern}
+	mux.m[pattern] = e
+	if pattern[len(pattern)-1] == '/' {
+		mux.es = appendSorted(mux.es, e)
+	}
+    //...
+}
+```
+
+
+
+```go 
+func appendSorted(es []muxEntry, e muxEntry) []muxEntry {
+	n := len(es)
+	i := sort.Search(n, func(i int) bool {
+		return len(es[i].pattern) < len(e.pattern)
+	})
+	if i == n {
+		return append(es, e)
+	}
+	// we now know that i points at where we want to insert
+	es = append(es, muxEntry{}) // try to grow the slice in place, any entry works.
+	copy(es[i+1:], es[i:])      // Move shorter entries down
+	es[i] = e
+	return es
+}
+```
+
+### 2.3 启动server
+
+调用net/http包下的公开方法ListenAndServe，可以实现对服务端一键启动。内部声明初始化了一个新的Server对象，嵌套执行Server.ListenAndServe 方法。
+
+```go
+func ListenAndServe(addr string, handler Handler) error {
+	server := &Server{Addr: addr, Handler: handler}
+	return server.ListenAndServe()
+}
+```
+
+
+
+Server.ListenAndServe 方法中，根据用户传入的地址端口，申请一个监听器Listener，继而调用Server.Serve方法。
+
+```go 
+
+func (srv *Server) ListenAndServe() error {
+	if srv.shuttingDown() {
+		return ErrServerClosed
+	}
+	addr := srv.Addr
+	if addr == "" {
+		addr = ":http"
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return srv.Serve(ln)
+}
+```
+
+
+
+Serve.Serve方法很核心，体现了http服务端的运行架构： for + listener.accept模式。
+
+- 将server封装成一组kv对，添加到context中
+- 开启for循环，每轮循环调用 listener.accept方法阻塞等待新连接到达
+- 每有一个连接到达，创建一个goroutine 异步执行 conn.serve方法处理
+
+```go
+ServerContextKey = &contextKey{"http-server"}
+
+type contextKey struct {
+	name string
+}
+```
+
+```go
+
+func (srv *Server) Serve(l net.Listener) error {
+	//...
+	ctx := context.WithValue(baseCtx, ServerContextKey, srv)
+	for {
+		rw, err := l.Accept()
+		//...
+		connCtx := ctx
+		//...
+		c := srv.newConn(rw)
+		//...
+		go c.serve(connCtx)
+	}
+}
+
+```
+
+
+
+
+
+ conn.serve方法是响应客户端连接的核心方法：
+
+- 从conn中读取到封装到response结构体，以及请求参数http.Request
+- 调用ServerHandler.ServeHTTP方法，根据请求的path 为其分配handler
+- 通过特定的handler处理并响应请求
+
+```go
+// Serve a new connection.
+func (c *conn) serve(ctx context.Context) {
+    //...
+	// HTTP/1.x from here on.
+	ctx, cancelCtx := context.WithCancel(ctx)
+	c.cancelCtx = cancelCtx
+	defer cancelCtx()
+
+	c.r = &connReader{conn: c}
+	c.bufr = newBufioReader(c.r)
+	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
+
+	for {
+		w, err := c.readRequest(ctx)
+		//...
+		serverHandler{c.server}.ServeHTTP(w, w.req)
+		//...
+		w.cancelCtx()
+		//...
+	}
+}
+```
+
+
+
+ServerHandler.ServeHTTP方法会对Handler做判断，倘若其未声明，则取全局单例DefaultServeMux进行路由匹配，呼应了http.HandleFunc中的处理细节
+
+```go
+func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
+	handler := sh.srv.Handler
+	if handler == nil {
+		handler = DefaultServeMux
+	}
+		//....
+	handler.ServeHTTP(rw, req)
+}
+```
+
+
+
+接下来，兜兜转转依次调用ServeMux.ServeHTTP、ServeMux.Handler、ServeMux.handler等方法，最终在ServeMux.match方法中，以Request中的path为pattern ，在路由字典 Server.m中匹配handler，最后调用handler.ServeHTTP方法进行请求的处理和响应
+
+```go
+
+func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
+//...
+	h, _ := mux.Handler(r)//在路由字典 Server.m中匹配handler
+	h.ServeHTTP(w, r) //最后调用handler.ServeHTTP方法进行请求的处理和响应
+}
+
+
+func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
+    //...
+	return mux.handler(host, r.URL.Path)
+}
+
+
+func (mux *ServeMux) handler(host, path string) (h Handler, pattern string) {
+	mux.mu.RLock()
+	defer mux.mu.RUnlock()
+
+	// Host-specific pattern takes precedence over generic ones
+	if mux.hosts {
+		h, pattern = mux.match(host + path)
+	}
+	if h == nil {
+		h, pattern = mux.match(path)
+	}
+	if h == nil {
+		h, pattern = NotFoundHandler(), ""
+	}
+	return
+}
+
+```
+
+
+
+当通过路由字典ServeMux.m未命中handler时，此时会启动模糊匹配模式，两个核心规则：
+
+- 以 '/'结尾的patterns才能被添加到ServeMux.es数组中，才有资格参与模糊匹配
+- 模糊匹配时，会找一个与请求路径path的前缀完全匹配且长度最长的pattern，取其对应的handler作为本次请求的处理函数
+
+```go
+// Find a handler on a handler map given a path string.
+// Most-specific (longest) pattern wins.
+func (mux *ServeMux) match(path string) (h Handler, pattern string) {
+	// Check for exact match first.
+	v, ok := mux.m[path]
+	if ok {
+		return v.h, v.pattern
+	}
+
+	// Check for longest valid match.  mux.es contains all patterns
+	// that end in / sorted from longest to shortest. 由长到短排序
+	for _, e := range mux.es {
+		if strings.HasPrefix(path, e.pattern) {
+			return e.h, e.pattern
+		}
+	}
+	return nil, ""
+}
+```
+
+
+
