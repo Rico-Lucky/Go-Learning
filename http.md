@@ -209,4 +209,4 @@ func TestClient(t *testing.T) {
 
 ### 2.2 注册 handler
 
-![](D:\文档\笔记\go语言基础\tmp\go-http-handler注册主干链路.PNG)
+![](D:\文档\笔记\go语言基础\Go-Learning\tmp\go-http-handler注册主干链路.PNG)
