@@ -57,6 +57,25 @@ func TestClient(t *testing.T) {
 }
 ```
 
+
+
+- 源码位置预览
+
+  | 模块             | 文件                  |
+  | ---------------- | --------------------- |
+  | 服务端           | net/http/server.go    |
+  | 客户端--主流程   | net/http/client.go    |
+  | 客户端--构造请求 | net/http/request.gp   |
+  | 客户端--网络交互 | net/http/transport.go |
+
+  
+
+
+
+
+
+
+
 ## 2.服务端
 
 ### 2.1 核心数据结构
@@ -477,6 +496,633 @@ func (mux *ServeMux) match(path string) (h Handler, pattern string) {
 		}
 	}
 	return nil, ""
+}
+```
+
+## 3.客户端
+
+### 3.1 核心数据结构
+
+(1) Client
+
+与Server对仗，客户端模块有一个Client类，实体对于整个模块的封装：
+
+```go
+type Client struct {
+
+	Transport RoundTripper //负责http通信的核心部分
+
+	CheckRedirect func(req *Request, via []*Request) error
+
+	Jar CookieJar //Cookie管理
+
+	Timeout time.Duration  //超时设置
+}
+```
+
+（2）RoundTripper 是通信模块的 interface ,需要实现方法 RoundTrip，即通过传入的请求 Request，与服务端交互后获得响应Response
+
+```go
+type RoundTripper interface {
+	RoundTrip(*Request) (*Response, error)
+}
+```
+
+（3）Transport 是 RoundTripper的实现类，核心字段包括：
+
+```go
+
+type Transport struct {
+    //....
+	idleConn     map[connectMethodKey][]*persistConn //空闲连接map,实现复用
+    //....
+    DialContext func(ctx context.Context, network, addr string) (net.Conn, error) //新连接器
+    //....
+}
+```
+
+
+
+（4）Request
+
+​	http请求参数结构体	
+
+```go
+type Request struct {
+	Method string //请求方法(GET, POST, PUT, etc.).
+	URL *url.URL //请求路径
+	Proto      string // "HTTP/1.0" 请求协议
+	Header Header //请求头
+	Body io.ReadCloser //请求参数内容
+    Host string  //服务器主机
+	Form url.Values //query 请求参数
+	Response *Response //响应参数struct
+	ctx context.Context //请求链路上下文
+     //......
+}
+```
+
+
+
+（5）Response
+
+http响应参数结构体
+
+```go
+type Response struct {
+	Status     string // e.g. "200 OK" 
+	StatusCode int    // e.g. 200    请求状态码 200-请求成功
+	Proto      string // e.g. "HTTP/1.0" 协议类型：http协议
+	Header Header     //请求头
+	Body io.ReadCloser //响应参数内容
+	Request *Request  //指向请求参数
+    //......
+}
+```
+
+### 3.2 方法链路
+
+客户端发起一次http请求大致分为以下步骤：
+
+- 构造http请求参数
+- 获取与服务端交互的tcp连接
+- 通过tcp连接发送请求参数
+- 通过tcp连接接收响应参数
+
+整体方法链路：
+
+![](./tmp/client发送http请求整体链路.png)
+
+### 3.3 Client.Post
+
+调用net/http 包下的公开方法Post时，需要传入服务端地址url，请求参数格式 contentType 以及请求参数的 io reader 
+
+方法中会使用包下的单例客户端  DefaultClient 处理本次请求：
+
+```go
+// DefaultClient is the default Client and is used by Get, Head, and Post.
+var DefaultClient = &Client{}
+
+func Post(url, contentType string, body io.Reader) (resp *Response, err error) {
+	return DefaultClient.Post(url, contentType, body)
+}
+
+
+```
+
+
+
+Client.Post方法，首先会结合用户的入参，NewRequest构造完整的请求参数Request ，继而通过Client.Do方法处理这次请求。
+
+```go
+func (c *Client) Post(url, contentType string, body io.Reader) (resp *Response, err error) {
+	req, err := NewRequest("POST", url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	return c.Do(req)
+}
+```
+
+### 3.4 NewRequest 
+
+NewRequest 方法中，返回NewRequestWithContext方法，其根据用户传入的method 、url、请求参数内容，构造Request实例。
+
+```go
+func NewRequestWithContext(ctx context.Context, method, url string, body io.Reader) (*Request, error) {
+	//...
+	u, err := urlpkg.Parse(url)
+	//...
+	rc, ok := body.(io.ReadCloser)
+	if !ok && body != nil {
+		rc = io.NopCloser(body)
+	}
+	//...
+	req := &Request{
+		ctx:        ctx,
+		Method:     method,
+		URL:        u,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(Header),
+		Body:       rc,
+		Host:       u.Host,
+	}
+	//...
+	return req, nil
+}
+```
+
+### 3.5 Client.Do
+
+```go
+func (c *Client) Do(req *Request) (*Response, error) {
+	return c.do(req)
+}
+
+```
+
+```go
+func (c *Client) do(req *Request) (retres *Response, reterr error) {
+	//...	
+	var (
+		deadline      = c.deadline()
+		reqs          []*Request
+		resp          *Response
+	//...
+	)
+	//...
+	for {
+		//...
+		var didTimeout func() bool
+		if resp, didTimeout, err = c.send(req, deadline); err != nil {
+			//...
+		}
+	//...
+}
+```
+
+在 Client.send 方法中，通过send方法发送请求之前和之后，分别对Cookies进行更新。
+
+```go
+// didTimeout is non-nil only if err != nil.
+func (c *Client) send(req *Request, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
+    //设置cookie到请求头中
+	if c.Jar != nil {
+		for _, cookie := range c.Jar.Cookies(req.URL) {
+			req.AddCookie(cookie)
+		}
+	}
+    //发送请求
+	resp, didTimeout, err = send(req, c.transport(), deadline)
+	if err != nil {
+		return nil, didTimeout, err
+	}
+    //更新resp的cookie到请求头中
+	if c.Jar != nil {
+		if rc := resp.Cookies(); len(rc) > 0 {
+			c.Jar.SetCookies(req.URL, rc)
+		}
+	}
+	return resp, nil, nil
+}
+```
+
+在调用send方法时，需要注入RoundTripper 模块，默认会使用全局单例DefaultTransport进行注入，核心逻辑在于**Transport.RoundTrip** 方法中，其实分为两步骤：
+
+- 获取/构造tcp连接
+- 通过tcp连接完成与服务端的交互。
+
+```go
+var DefaultTransport RoundTripper = &Transport{
+	//...
+	DialContext: defaultTransportDialContext(&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}),
+//...
+}
+
+func (c *Client) transport() RoundTripper {
+	if c.Transport != nil {
+		return c.Transport
+	}
+	return DefaultTransport
+}
+
+```
+
+```go
+func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
+	//....
+	resp, err = rt.RoundTrip(req)
+    //...
+    return resp, nil, nil
+}
+```
+
+```go
+func (t *Transport) RoundTrip(req *Request) (*Response, error) {
+	return t.roundTrip(req)
+}
+```
+
+```go
+// roundTrip implements a RoundTripper over HTTP.
+func (t *Transport) roundTrip(req *Request) (*Response, error) {
+	//...
+	for {
+		select {
+		case <-ctx.Done():
+			req.closeBody()
+			return nil, ctx.Err()
+		default:
+		}
+
+		// treq gets modified by roundTrip, so we need to recreate for each retry.
+		treq := &transportRequest{Request: req, trace: trace, cancelKey: cancelKey}
+		cm, err := t.connectMethodForRequest(treq)
+		if err != nil {
+			req.closeBody()
+			return nil, err
+		}
+
+		// Get the cached or newly-created connection to either the
+		// host (for http or https), the http proxy, or the http proxy
+		// pre-CONNECTed to https server. In any case, we'll be ready
+		// to send it requests.
+		pconn, err := t.getConn(treq, cm)
+	    //...
+
+		var resp *Response
+		if pconn.alt != nil {
+			// HTTP/2 path.
+			t.setReqCanceler(cancelKey, nil) // not cancelable with CancelRequest
+			resp, err = pconn.alt.RoundTrip(req)
+		} else {
+			resp, err = pconn.roundTrip(treq)
+		}
+		//...
+    }     
+}
+```
+
+### 3.6 Transport.getConn
+
+获取TCP连接的策略分为两步：
+
+- 通过queueForIdleConn方法尝试复用采用相同协议，访问相同服务端的空闲连接
+- 倘若无连接，则通过queueForDial方法，异步创建一个新的连接，并通过接收ready channel的信号方式，确认构造连接工作完成。
+
+```go
+// getConn dials and creates a new persistConn to the target as
+// specified in the connectMethod. This includes doing a proxy CONNECT
+// and/or setting up TLS.  If this doesn't return an error, the persistConn
+// is ready to write requests to.
+func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *persistConn, err error) {
+	//获取连接的请求参数体
+	w := &wantConn{
+		cm:         cm,
+		key:        cm.key(), //key由http协议、服务端地址等信息组成
+		ctx:        ctx,
+		ready:      make(chan struct{}, 1),  //ready标识连接构造成功的信号发射器
+		beforeDial: testHookPrePendingDial,
+		afterDial:  testHookPostPendingDial,
+	}
+    //倘若连接获取失败，在 wantConn.cancel方法中，尝试将tcp连接放回队列中以供后续复用
+	defer func() {
+		if err != nil {
+			w.cancel(t, err)
+		}
+	}()
+
+	// Queue for idle connection. 尝试复用指向相同服务端地址的空闲连接
+	if delivered := t.queueForIdleConn(w); delivered {
+		pc := w.pc
+		//...
+		return pc, nil
+	}
+	//...
+	// Queue for permission to dial.   异步构造新的连接
+	t.queueForDial(w)
+
+	// Wait for completion or cancellation. 
+	select {
+	case <-w.ready:   //通过阻塞等待信号的方式，等待连接获取完成
+		//...
+		return w.pc, w.err
+		//...
+	}
+}
+```
+
+#### (1) 复用连接
+
+- 尝试从Transport.idleConn中获取指向同一服务端的空闲连接persistConn
+- 获取到连接后会调用wantConn.tryDeliver 方法将连接绑定到wantConn请求参数上】
+- 绑定成功后，会关闭wantConn.reday channel，以唤醒阻塞读取该channel的goroutine
+
+```go
+func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
+    //...
+	if list, ok := t.idleConn[w.key]; ok {
+		//...
+		for len(list) > 0 && !stop {
+			pconn := list[len(list)-1]
+		//...
+			delivered = w.tryDeliver(pconn, nil)
+			if delivered {
+					//...
+					list = list[:len(list)-1]
+				}
+			}
+			stop = true
+		}
+		//...
+		if stop {
+			return delivered
+		}
+	}
+	//...
+	return false
+}
+
+```
+
+```go
+// tryDeliver attempts to deliver pc, err to w and reports whether it succeeded.
+func (w *wantConn) tryDeliver(pc *persistConn, err error) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	//...
+	w.pc = pc
+	w.err = err
+	//...
+	close(w.ready)
+	return true
+}
+```
+
+#### (2) 创建连接
+
+在queueForDial方法中会异步调用Transport.dialConnFor方法，创建新的tcp连接，由于是异步操作，所以在上游会通过读取channel的方式，等待创建操作完成。
+
+这里之所以采用异步操作进行连接创建，有两部分原因：
+
+- 一个tcp连接并不是一个静态的数据结构，它是有生命周期的，创建过程中会为其创建负责读写的两个守护协程，伴随而生。
+- 在上游Transport.queueForIdleConn方法中，当通过select多路复用的方式，接受到其他终止信号时，可以提前调用wantConn.cancel方法打断创建连接的goroutine ，相比于串行化执行，异步交互更有灵活性。
+
+```go
+func (t *Transport) queueForDial(w *wantConn) {
+	//....
+	go t.dialConnFor(w)
+	//...
+}
+```
+
+Transport.dialConnFor方法中，首先调用 Transport.dialConn 创建tcp连接persistConn，接着执行wantConn.tryDeliver方法，将连接绑定到wantConn上，然后通过关闭ready channel 操作唤醒上游读 ready channel 的goroutine。
+
+```go
+
+func (t *Transport) dialConnFor(w *wantConn) {
+	defer w.afterDial()
+	//...
+	pc, err := t.dialConn(w.ctx, w.cm)
+	delivered := w.tryDeliver(pc, err)
+	//...
+}
+```
+
+
+
+ Transport.dialConn  方法包含了创建tcp连接的核心逻辑：
+
+- 调用Transport.dial方法，最终通过Transport.DialContext成员函数，创建好tcp连接，封装到persistConn中。
+- 异步启动连接伴生读写协程 readLoop 和 writeLoop 方法，组成提交请求、接收响应的循环
+
+```go
+func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *persistConn, err error) {
+    	pconn = &persistConn{
+		t:             t,
+		cacheKey:      cm.key(),
+		reqch:         make(chan requestAndChan, 1),
+		writech:       make(chan writeRequest, 1),
+		//...
+	}
+    conn, err := t.dial(ctx, "tcp", cm.addr())
+	//...
+	pconn.conn = conn
+    //...
+    go pconn.readLoop()
+	go pconn.writeLoop()
+	return pconn, nil
+}
+```
+
+```go
+func (t *Transport) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	//...
+	return t.DialContext(ctx, network, addr)
+	//...
+}
+```
+
+
+
+```go
+// tryDeliver attempts to deliver pc, err to w and reports whether it succeeded.
+func (w *wantConn) tryDeliver(pc *persistConn, err error) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.pc != nil || w.err != nil {
+		return false
+	}
+
+	w.pc = pc
+	w.err = err
+	if w.pc == nil && w.err == nil {
+		panic("net/http: internal error: misuse of tryDeliver")
+	}
+	close(w.ready)
+	return true
+}
+```
+
+
+
+persistConn.readLoop 方法中，会读取来自服务端的响应，并添加到persistConn.reqch中，供给上游persistConn.roundTrip方法接收。
+
+```go
+func (pc *persistConn) readLoop() {
+	//...
+	alive := true
+	for alive {
+		//...
+		rc := <-pc.reqch
+		//...
+		var resp *Response
+		//...
+		resp, err = pc.readResponse(rc, trace)
+        //...
+		select {
+		case rc.ch <- responseAndError{res: resp}:
+		case <-rc.callerGone:
+			return
+		}
+}
+```
+
+
+
+
+
+persistConn.writeLoop方法中，会通过persistConn.writech读取到客户端提交的信息，然后将其发送到服务端。
+
+```go
+func (pc *persistConn) writeLoop() {
+	//...
+	for {
+		select {
+		case wr := <-pc.writech:
+			//...
+			err := wr.req.Request.write(pc.bw, pc.isProxy, wr.req.extra, pc.waitForContinue(wr.continueCh))
+			//...
+        }
+}
+```
+
+
+
+#### (3) 归还连接
+
+有复用连接的能力，就必然存在有归还连接的机制
+
+首先，在构造新连接中途，倘若被打断，则可能会将连接放回队列以供复用
+
+```go
+func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *persistConn, err error) {
+	//....
+    //倘若连接获取失败，在 wantConn.cancel方法中，尝试将tcp连接放回队列中以供后续复用
+	defer func() {
+		if err != nil {
+			w.cancel(t, err)
+		}
+    }()
+	//....
+}
+```
+
+```go
+func (w *wantConn) cancel(t *Transport, err error) {
+	w.mu.Lock()
+	if w.pc == nil && w.err == nil {
+		close(w.ready) // catch misbehavior in future delivery
+	}
+	pc := w.pc
+	w.pc = nil
+	w.err = err
+	w.mu.Unlock()
+
+	if pc != nil {
+		t.putOrCloseIdleConn(pc)
+	}
+}
+```
+
+```go
+func (t *Transport) putOrCloseIdleConn(pconn *persistConn) {
+	if err := t.tryPutIdleConn(pconn); err != nil {
+		pconn.close(err)
+	}
+}
+
+func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
+	//...
+	key := pconn.cacheKey
+	//...
+	t.idleConn[key] = append(idles, pconn)
+	t.idleLRU.add(pconn)
+    //...
+	return nil
+}
+```
+
+其次，倘若与服务端的一轮交互流程结束，也会将连接放回队列以供复用
+
+```go
+func (pc *persistConn) readLoop() {
+  	//...
+    tryPutIdleConn := func(trace *httptrace.ClientTrace) bool {
+		if err := pc.t.tryPutIdleConn(pc); err != nil {
+			//...
+		}
+        //...
+	}
+    
+   alive := true
+   for alive {
+       		select {
+                case bodyEOF := <-waitForBodyRead:
+            	//...
+                tryPutIdleConn(trace)
+                //...
+            } 
+    }
+}
+```
+
+### 3.7 persistConn.roundTrip
+
+- 首先将http请求通过persistConn.writech发送给连接的守护协程writeLoop，并进一步传送到服务端
+- 其次通过读取 resc channel ，接收由守护协程readLoop代理转发的客户端响应数据。
+
+```go
+func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
+	//...
+	writeErrCh := make(chan error, 1)
+	pc.writech <- writeRequest{req, writeErrCh, continueCh}
+
+	resc := make(chan responseAndError)
+	pc.reqch <- requestAndChan{
+		req:        req.Request,
+		cancelKey:  req.cancelKey,
+		ch:         resc,
+		//...
+	}
+	//...
+	for {
+		testHookWaitResLoop()
+		select {
+			//...
+		case re := <-resc:
+				//...
+			return re.res, nil
+		//...
+		}
+	}
 }
 ```
 
